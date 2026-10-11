@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AR 放置立方体 - Three.js</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #000;
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            background: rgba(0, 0, 0, 0.55);
+            padding: 10px 22px;
+            border-radius: 30px;
+            z-index: 100;
+            pointer-events: none;
+            backdrop-filter: blur(8px);
+            font-size: 14px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            white-space: nowrap;
+            transition: opacity 0.3s;
+        }
+        #status {
+            position: absolute;
+            bottom: 40px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px 24px;
+            border-radius: 30px;
+            font-size: 15px;
+            z-index: 100;
+            backdrop-filter: blur(8px);
+            white-space: nowrap;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            pointer-events: none;
+            transition: opacity 0.3s;
+        }
+        .hidden { display: none !important; }
+        /* 覆盖 ARButton 默认样式 */
+        #ar-button-container {
+            position: absolute;
+            bottom: 100px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">📱 移动手机寻找平面</div>
+    <div id="status">点击按钮启动 AR</div>
+    <div id="ar-button-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.128.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.128.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+        // ========== 1. 基础场景 ==========
+        const scene = new THREE.Scene();
+
+        const camera = new THREE.PerspectiveCamera(
+            70, window.innerWidth / window.innerHeight, 0.01, 40
+        );
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.xr.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // ========== 2. 灯光 ==========
+        // AR 场景中光很重要，环境光模拟真实环境，方向光产生立体感
+        const ambientLight = new THREE.AmbientLight(0xffffff, 1.2);
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(3, 6, 3);
+        scene.add(directionalLight);
+
+        // ========== 3. 创建虚拟物体（点击后放置的东西） ==========
+        function createCube() {
+            const size = 0.15; // 15cm 大小，更接近现实物体尺寸
+            const geometry = new THREE.BoxGeometry(size, size, size);
+            const colors = [0xff3b30, 0x34c759, 0x007aff, 0xff9500, 0xffcc00, 0xaf52de];
+            const materials = colors.map(c => new THREE.MeshStandardMaterial({
+                color: c,
+                roughness: 0.35,
+                metalness: 0.5,
+                emissive: new THREE.Color(c).multiplyScalar(0.15)
+            }));
+            const cube = new THREE.Mesh(geometry, materials);
+            
+            // 白色线框让物体更清晰
+            const wireframe = new THREE.LineSegments(
+                new THREE.EdgesGeometry(geometry),
+                new THREE.LineBasicMaterial({ color: 0xffffff })
+            );
+            cube.add(wireframe);
+            
+            // 每个立方体轻微随机旋转，更自然
+            cube.rotation.y = Math.random() * Math.PI;
+            
+            return cube;
+        }
+
+        // 保存所有已放置的物体，用于动画
+        const placedObjects = [];
+
+        // ========== 4. Hit Test 相关：平面检测与准星 ==========
+        // 准星（reticle）：在未放置前，显示一个环，提示用户平面在哪里
+        const reticleGeometry = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2);
+        const reticleMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
+        const reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
+        reticle.matrixAutoUpdate = false; // 手动控制矩阵
+        reticle.visible = false;
+        scene.add(reticle);
+
+        // 保存 hit test 源
+        let hitTestSource = null;
+        let hitTestSourceRequested = false;
+        let localSpace = null;
+
+        // ========== 5. 启动 AR 按钮 ==========
+        const buttonContainer = document.getElementById('ar-button-container');
+        const arButton = ARButton.createButton(renderer, {
+            requiredFeatures: ['hit-test'],
+            optionalFeatures: ['dom-overlay'],
+            domOverlay: { root: document.getElementById('info') }
+        });
+
+        // 美化 AR 按钮
+        Object.assign(arButton.style, {
+            padding: '16px 36px',
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            color: 'white',
+            border: 'none',
+            borderRadius: '50px',
+            fontSize: '17px',
+            fontWeight: '600',
+            letterSpacing: '0.5px',
+            cursor: 'pointer',
+            boxShadow: '0 10px 30px rgba(102, 126, 234, 0.5)',
+            fontFamily: 'inherit'
+        });
+
+        buttonContainer.appendChild(arButton);
+
+        // 状态提示元素
+        const statusDiv = document.getElementById('status');
+        const infoDiv = document.getElementById('info');
+
+        // ========== 6. 点击屏幕放置物体 ==========
+        // 通过监听 select 事件（AR中点击屏幕触发）
+        const controller = renderer.xr.getController(0);
+        scene.add(controller);
+
+        controller.addEventListener('select', () => {
+            // 只有在准星可见（检测到平面）时才放置
+            if (reticle.visible) {
+                const cube = createCube();
+                // 从准星的矩阵中提取位置和旋转
+                cube.position.setFromMatrixPosition(reticle.matrix);
+                // 让立方体稍微抬起，坐在平面上而不是中心在平面上
+                cube.position.y += 0.075; 
+                cube.quaternion.setFromRotationMatrix(reticle.matrix);
+                
+                scene.add(cube);
+                placedObjects.push({
+                    mesh: cube,
+                    baseY: cube.position.y,
+                    phase: Math.random() * Math.PI * 2
+                });
+
+                // 轻微反馈：准星闪一下
+                reticleMaterial.color.setHex(0x66ff99);
+                setTimeout(() => reticleMaterial.color.setHex(0xffffff), 150);
+
+                // 更新提示文字
+                infoDiv.textContent = `✅ 已放置 ${placedObjects.length} 个物体 · 继续点击放置`;
+            }
+        });
+
+        // ========== 7. AR 会话开始/结束 ==========
+        renderer.xr.addEventListener('sessionstart', () => {
+            statusDiv.textContent = '🔍 缓慢移动手机寻找平面...';
+            infoDiv.textContent = '📱 移动手机寻找平面';
+        });
+
+        renderer.xr.addEventListener('sessionend', () => {
+            // 清理场景中放置的物体
+            placedObjects.forEach(obj => scene.remove(obj.mesh));
+            placedObjects.length = 0;
+            reticle.visible = false;
+            hitTestSource = null;
+            hitTestSourceRequested = false;
+            statusDiv.textContent = '点击按钮重新启动 AR';
+            infoDiv.textContent = '📱 移动手机寻找平面';
+        });
+
+        // ========== 8. 渲染循环 ==========
+        const clock = new THREE.Clock();
+
+        renderer.setAnimationLoop((timestamp, frame) => {
+            // --- Hit Test 逻辑 ---
+            if (frame) {
+                // 第一次进入时请求 hit test source
+                if (!hitTestSourceRequested) {
+                    const session = renderer.xr.getSession();
+                    session.requestReferenceSpace('viewer').then((referenceSpace) => {
+                        session.requestHitTestSource({ space: referenceSpace }).then((source) => {
+                            hitTestSource = source;
+                        });
+                    });
+                    session.addEventListener('end', () => {
+                        hitTestSourceRequested = false;
+                        hitTestSource = null;
+                    });
+                    hitTestSourceRequested = true;
+                }
+
+                // 每一帧根据 hit test 结果更新准星位置
+                if (hitTestSource) {
+                    const referenceSpace = renderer.xr.getReferenceSpace();
+                    const hitTestResults = frame.getHitTestResults(hitTestSource);
+
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        const pose = hit.getPose(referenceSpace);
+                        
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(pose.transform.matrix);
+
+                        // 检测到平面，更新状态
+                        if (statusDiv.textContent !== '🎯 点击屏幕放置物体') {
+                            statusDiv.textContent = '🎯 点击屏幕放置物体';
+                            infoDiv.textContent = '👆 点击屏幕放置立方体';
+                        }
+                    } else {
+                        reticle.visible = false;
+                        if (placedObjects.length === 0) {
+                            statusDiv.textContent = '🔍 缓慢移动手机寻找平面...';
+                        }
+                    }
+                }
+            }
+
+            // --- 已放置物体的动画（轻微上下浮动 + 旋转） ---
+            const elapsed = clock.getElapsedTime();
+            placedObjects.forEach(obj => {
+                // 旋转
+                obj.mesh.rotation.y += 0.008;
+                // 轻微上下浮动
+                obj.mesh.position.y = obj.baseY + Math.sin(elapsed * 2 + obj.phase) * 0.01;
+            });
+
+            renderer.render(scene, camera);
+        });
+
+        // ========== 9. 窗口自适应 ==========
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // 检查设备是否支持 AR
+        if (navigator.xr) {
+            navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+                if (!supported) {
+                    statusDiv.textContent = '❌ 此设备不支持 AR (需要 ARCore/ARKit)';
+                    arButton.style.display = 'none';
+                }
+            });
+        } else {
+            statusDiv.textContent = '❌ 浏览器不支持 WebXR';
+            arButton.style.display = 'none';
+        }
+    </script>
+</body>
+</html>
